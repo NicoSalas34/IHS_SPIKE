@@ -1,11 +1,11 @@
 data:
-    input_path: /media/salas/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/Temp #F:\fourmis\IHS_SPIKE_fourmis24\data\epis_preda
-    output_path: /media/salas/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/output  #SOLACE2021 #F:\fourmis\IHS_SPIKE_fourmis24\results\epis_preda
+    input_path: /media/debian/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/Temp #F:\fourmis\IHS_SPIKE_fourmis24\data\epis_preda
+    output_path: /media/debian/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/output  #SOLACE2021 #F:\fourmis\IHS_SPIKE_fourmis24\results\epis_preda
 
 segment_kernels:
     model_path: models/sam_b.pt
     output_mask_path: None
-    device: cuda # cuda
+    device: cuda #cpu
     model_type: vit_b # vit_l
     area_min: 700 # 4000
     area_max: 5000 #15000

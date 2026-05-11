@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -85,16 +86,22 @@ def collect_hdr_files(input_path: Path) -> list[Path]:
     return sorted(input_path.rglob("*.hdr"))
 
 
+def is_loadable(hdr_file: Path) -> bool:
+    hyspex = str(hdr_file).replace(".hdr", ".hyspex")
+    return os.path.exists(hyspex) and os.stat(hyspex).st_size >= 3e8
+
+
 def process_one(hdr_file: Path, output_dir: Path, mask_gen,
                crop_x_left: int, crop_x_right: int,
                area_min: int, area_max: int,
-               default_label: str, epsilon_ratio: float) -> bool:
-    hyspex = str(hdr_file).replace(".hdr", ".hyspex")
-    if not os.path.exists(hyspex):
-        print(f"  ! skip (no .hyspex): {hdr_file.name}")
-        return False
-    if os.stat(hyspex).st_size < 3e8:
-        print(f"  ! skip (file too small): {hdr_file.name}")
+               default_label: str, epsilon_ratio: float,
+               spectrum=None) -> bool:
+    if not is_loadable(hdr_file):
+        hyspex = str(hdr_file).replace(".hdr", ".hyspex")
+        if not os.path.exists(hyspex):
+            print(f"  ! skip (no .hyspex): {hdr_file.name}")
+        else:
+            print(f"  ! skip (file too small): {hdr_file.name}")
         return False
 
     stem = hdr_file.stem
@@ -104,7 +111,8 @@ def process_one(hdr_file: Path, output_dir: Path, mask_gen,
         print(f"  - already done: {stem}")
         return True
 
-    spectrum = SpectrumCamera(str(hdr_file))
+    if spectrum is None:
+        spectrum = SpectrumCamera(str(hdr_file))
     rgb = spectrum.image_rgb[:, crop_x_left:crop_x_right]
     rgb_u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
     cv2.imwrite(str(out_jpg), cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR))
@@ -159,17 +167,45 @@ def main():
     files = collect_hdr_files(input_path)
     print(f"Found {len(files)} .hdr file(s)\n")
 
+    executor = ThreadPoolExecutor(max_workers=1)
+    pending_spectrum = None
+    pending_file = None
+
+    # Preload first loadable file
+    for f in files:
+        if is_loadable(f):
+            pending_spectrum = executor.submit(SpectrumCamera, str(f))
+            pending_file = f
+            break
+
     ok = 0
-    for i, hdr in enumerate(files, 1):
-        print(f"[{i}/{len(files)}] {hdr.name}")
+    for i, hdr in enumerate(files):
+        print(f"[{i+1}/{len(files)}] {hdr.name}")
         try:
+            # Get preloaded spectrum if available
+            spectrum = None
+            if pending_file == hdr and pending_spectrum is not None:
+                spectrum = pending_spectrum.result()
+
+            # Submit loading of next loadable file immediately
+            pending_spectrum = None
+            pending_file = None
+            for next_file in files[i + 1:]:
+                if is_loadable(next_file):
+                    pending_spectrum = executor.submit(SpectrumCamera, str(next_file))
+                    pending_file = next_file
+                    break
+
             if process_one(hdr, output_dir, mask_gen,
                           args.crop_x_left, args.crop_x_right,
                           args.area_min, args.area_max,
-                          args.default_label, args.epsilon):
+                          args.default_label, args.epsilon,
+                          spectrum=spectrum):
                 ok += 1
         except Exception as e:
             print(f"  !! error: {e}")
+
+    executor.shutdown(wait=False)
 
     print(f"\nDone: {ok}/{len(files)} processed -> {output_dir}")
     print("\nNext step: open the output folder in X-AnyLabeling, fix masks,")

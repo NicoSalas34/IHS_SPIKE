@@ -87,10 +87,10 @@ class Kernels():
 
     def save_rpops(self, output_path: str, sample: str, date: str, hour: str) -> None:
         attrok = (
-            'area', 'bbox_area', 'convex_area', 'eccentricity',
-            'equivalent_diameter', 'euler_number', 'extent',
-            'feret_diameter_max', 'filled_area', 'label',
-            'major_axis_length', 'minor_axis_length', 'orientation',
+            'area', 'area_bbox', 'area_convex', 'eccentricity',
+            'equivalent_diameter_area', 'euler_number', 'extent',
+            'feret_diameter_max', 'area_filled', 'label',
+            'axis_major_length', 'axis_minor_length', 'orientation',
             'perimeter', 'perimeter_crofton', 'solidity'
         )
         res_list = list()

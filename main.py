@@ -2,7 +2,7 @@
 File: main.py
 Authors: Clement Plessis - Martin Ecarnot
 Date: 11 Oct. 2024
-Description: This script is part of the IHS SPIKE project 
+Description: This script is part of the IHS SPIKE project
 and is designed to segment and get the morphology of
 wheat kernels after the
 hyperspectral data acquistione.
@@ -11,6 +11,7 @@ hyperspectral data acquistione.
 
 import yaml, time, os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from segment_anything import sam_model_registry
 from kernels import Kernels
 from spectrum import SpectrumCamera, SpectrumASD
@@ -31,13 +32,25 @@ sam.to(device=config["segment_kernels"]["device"])
 #       PROCESS FILES
 print(f"\nProcessing files from {config['data']['input_path']}\n")
 files = [i for i in Path(config["data"]["input_path"]).rglob("*.hdr")]
-#files=files[83:len(files)]
-# files = [i for i in Path(config["data"]["input_path"]).rglob("*.hdr")]
-# files=files[167:len(files)]
+
+def is_loadable(hdr_file):
+    hyspex_file = str(hdr_file).replace(".hdr", ".hyspex")
+    return os.path.exists(hyspex_file) and os.stat(hyspex_file).st_size >= 3e8
+
+executor = ThreadPoolExecutor(max_workers=1)
+pending_spectrum = None
+pending_file = None
+
+# Preload first loadable file
+for f in files:
+    if is_loadable(f):
+        pending_spectrum = executor.submit(SpectrumCamera, str(f))
+        pending_file = f
+        break
 
 t0 = time.time()
 n=0
-for hdr_file in files:
+for idx, hdr_file in enumerate(files):
     # ================================
     #           INIT
     n+=1
@@ -60,16 +73,28 @@ for hdr_file in files:
         print("One of ASD or HYSPEX is missing.")
         print("Skipping the missing element ...")
         asd_exist=False
-    if os.stat(hyspex_file).st_size < 3e8: #any([os.stat(asd_file).st_size < 3e4,os.stat(hyspex_file).st_size < 3e9]):
-        print("HYSPEX is too small.")  # print("One of ASD or HYSPEX is too small.")
+    if os.stat(hyspex_file).st_size < 3e8:
+        print("HYSPEX is too small.")
         print("Starting next file ...")
         continue
     # ================================
     #       Spectrum
     print("import hyperspex...")
     t0hyp = time.time()
-    # Load spectrum
-    spectrum = SpectrumCamera(str(hdr_file))
+    # Use preloaded spectrum if available, otherwise load synchronously
+    if pending_file == hdr_file and pending_spectrum is not None:
+        spectrum = pending_spectrum.result()
+    else:
+        spectrum = SpectrumCamera(str(hdr_file))
+
+    # Submit loading of next loadable file immediately
+    pending_spectrum = None
+    pending_file = None
+    for next_file in files[idx + 1:]:
+        if is_loadable(next_file):
+            pending_spectrum = executor.submit(SpectrumCamera, str(next_file))
+            pending_file = next_file
+            break
 
     # Save rgb image
     try :
@@ -86,7 +111,7 @@ for hdr_file in files:
     print(f"    > import hyperspex = {round(t1hyp-t0hyp, 0)}s")
     # ================================
     #      Kernels Segmentation
-    
+
     # Segmentation
     print("segmentation...")
     t0seg = time.time()
@@ -94,10 +119,10 @@ for hdr_file in files:
         image_rgb=np.divide(spectrum.img[:,:,spectrum.bands],2**15),  #spectrum.image_rgb
         sam_model=sam,
         crop_x_left = config["segment_kernels"]["crop_x_left"],
-        crop_x_right = config["segment_kernels"]["crop_x_right"] 
+        crop_x_right = config["segment_kernels"]["crop_x_right"]
     )
     t1seg = time.time()
-    print(f"    > seg time = {round(t1seg-t0seg, 0)}s")    
+    print(f"    > seg time = {round(t1seg-t0seg, 0)}s")
 
     # Filter masks
     print("number of masks BEFORE filtering : ", len(kernels.masks))
@@ -134,7 +159,7 @@ for hdr_file in files:
         print("saving kernels images...")
         kernels.save_kernels(
             output_path=config["data"]["output_path"],
-            sample=sample, date=date, hour=hour    
+            sample=sample, date=date, hour=hour
         )
 
     # Save kernel spectra
@@ -164,5 +189,6 @@ for hdr_file in files:
     print(f"    > approx remaining time = {round(((t1samp-t0samp)*(len(files)-n))/3600,2)} hours")
     print("\n")
 
+executor.shutdown(wait=False)
 t1 = time.time()
 print(f"All process done in {round((t1-t0)/3600,2)} hours.")
