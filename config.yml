@@ -1,14 +1,14 @@
 data:
-    input_path: E:\MS_2024 #F:\fourmis\IHS_SPIKE_fourmis24\data\epis_preda
-    output_path: C:\Users\HySpex_user\Documents\Martin\SPIKE_output\MaleSterile_2024  #SOLACE2021 #F:\fourmis\IHS_SPIKE_fourmis24\results\epis_preda
+    input_path: /media/salas/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/Temp #F:\fourmis\IHS_SPIKE_fourmis24\data\epis_preda
+    output_path: /media/salas/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/output  #SOLACE2021 #F:\fourmis\IHS_SPIKE_fourmis24\results\epis_preda
 
 segment_kernels:
     model_path: models/sam_b.pt
     output_mask_path: None
-    device: cpu # cuda
+    device: cuda # cuda
     model_type: vit_b # vit_l
     area_min: 700 # 4000
     area_max: 5000 #15000
     crop_x_left:  400 # 690
-    crop_x_right: 1800 #3470
+    crop_x_right: 2180 #3470
     save_kernels: False # save rgb image for each kernel or not

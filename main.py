@@ -155,9 +155,8 @@ for hdr_file in files:
             output_path=config["data"]["output_path"],
             sample=sample, date=date, hour=hour
         )
-
-    t1spec = time.time()
-    print(f"    > spec time = {round(t1spec-t0spec, 0)}s")
+        t1spec = time.time()
+        print(f"    > spec time = {round(t1spec-t0spec, 0)}s")
 
     t1samp = time.time()
     print("total time :")
