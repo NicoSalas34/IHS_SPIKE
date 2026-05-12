@@ -9,10 +9,14 @@ hyperspectral data acquistione.
 
 """
 
-import yaml, time, os
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
+import yaml, time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from kernels import Kernels, KernelsYOLO
+from kernels import Kernels, KernelsYOLO, KernelsSAMYOLO
 from spectrum import SpectrumCamera, SpectrumASD
 import numpy as np
 
@@ -20,6 +24,17 @@ import numpy as np
 #       PARAMETERS
 config = yaml.load(open('config.yml', 'r'), Loader=yaml.SafeLoader)
 MODE = config.get("mode", "sam")
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--input",  default=None, help="Override config input_path")
+ap.add_argument("--output", default=None, help="Override config output_path")
+args = ap.parse_args()
+
+if args.input:
+    config["data"]["input_path"] = args.input
+if args.output:
+    config["data"]["output_path"] = args.output
+    os.makedirs(args.output, exist_ok=True)
 
 # ================================
 #       LOAD MODEL
@@ -30,6 +45,30 @@ if MODE == "yolo":
     seg_model = YOLO(yolo_cfg["seg_model_path"])
     print(f"Mode YOLO — det: {yolo_cfg['det_model_path']}")
     print(f"           seg: {yolo_cfg['seg_model_path']}\n")
+elif MODE == "combined":
+    from ultralytics.models.sam import SAM3SemanticPredictor
+    from ultralytics import YOLO
+    combined_cfg = config["combined"]
+    _sam_imgsz = combined_cfg.get("imgsz_sam", 1024)
+    # SAM3 (ViT) requires imgsz multiple of 14; round up
+    _sam_imgsz = ((_sam_imgsz + 13) // 14) * 14
+    sam = SAM3SemanticPredictor(overrides=dict(
+        model=combined_cfg["sam_model_path"],
+        task="segment",
+        mode="predict",
+        device=combined_cfg["device"],
+        imgsz=_sam_imgsz,
+        verbose=False,
+        save=False,
+        show=False,
+        plots=False,
+    ))
+    det_model = YOLO(combined_cfg["det_model_path"])
+    seg_model = YOLO(combined_cfg["seg_model_path"])
+    print(f"Mode Combined — SAM3:   {combined_cfg['sam_model_path']}")
+    print(f"                prompts: {combined_cfg['sam_text_prompts']}")
+    print(f"                det:    {combined_cfg['det_model_path']}")
+    print(f"                seg:    {combined_cfg['seg_model_path']}\n")
 else:
     from segment_anything import sam_model_registry
     model_type = config["segment_kernels"]["model_type"]
@@ -58,6 +97,9 @@ for f in files:
         pending_file = f
         break
 
+input_root = Path(config["data"]["input_path"])
+output_root = Path(config["data"]["output_path"])
+
 t0 = time.time()
 n=0
 for idx, hdr_file in enumerate(files):
@@ -67,6 +109,10 @@ for idx, hdr_file in enumerate(files):
     asd_exist=True
     t0samp = time.time()
     print(f"progress {n}/{len(files)}")
+
+    file_output = output_root / hdr_file.parent.relative_to(input_root)
+    os.makedirs(file_output, exist_ok=True)
+    file_output = str(file_output)
     date = hdr_file.stem.split("_")[0]
     hour = hdr_file.stem.split("_")[1]
     sample = "_".join(hdr_file.stem.split("_")[2:-1])
@@ -109,7 +155,7 @@ for idx, hdr_file in enumerate(files):
     # Save rgb image
     try :
         spectrum.save_rgb(
-            output_path=config["data"]["output_path"],
+            output_path=file_output,
             sample=sample, date=date, hour=hour
         )
     except ValueError as error:
@@ -129,7 +175,7 @@ for idx, hdr_file in enumerate(files):
 
     if MODE == "yolo":
         kernels = KernelsYOLO(
-            image_rgb=image_rgb,
+            image_rgb=spectrum.image_rgb,
             det_model=det_model,
             seg_model=seg_model,
             crop_x_left=yolo_cfg["crop_x_left"],
@@ -142,6 +188,25 @@ for idx, hdr_file in enumerate(files):
             device=yolo_cfg["device"],
         )
         seg_cfg = yolo_cfg
+    elif MODE == "combined":
+        kernels = KernelsSAMYOLO(
+            image_rgb=spectrum.image_rgb,
+            sam_model=sam,
+            det_model=det_model,
+            seg_model=seg_model,
+            crop_x_left=combined_cfg["crop_x_left"],
+            crop_x_right=combined_cfg["crop_x_right"],
+            text_prompts=combined_cfg["sam_text_prompts"],
+            det_conf=combined_cfg["det_conf"],
+            seg_conf=combined_cfg["seg_conf"],
+            nms_threshold=combined_cfg["nms_threshold"],
+            iou_threshold=combined_cfg["iou_threshold"],
+            pad=combined_cfg["pad"],
+            imgsz_det=combined_cfg["imgsz_det"],
+            imgsz_seg=combined_cfg["imgsz_seg"],
+            device=combined_cfg["device"],
+        )
+        seg_cfg = combined_cfg
     else:
         kernels = Kernels(
             image_rgb=image_rgb,
@@ -166,7 +231,7 @@ for idx, hdr_file in enumerate(files):
     print("saving masks...")
     t0smask = time.time()
     kernels.save_masks(
-        output_path=config["data"]["output_path"],
+        output_path=file_output,
         sample=sample, date=date, hour=hour
     )
     t1smask = time.time()
@@ -178,7 +243,7 @@ for idx, hdr_file in enumerate(files):
     kernels.add_regionprops()
 
     kernels.save_rpops(
-        output_path=config["data"]["output_path"],
+        output_path=file_output,
         sample=sample, date=date, hour=hour
     )
     t1rpro = time.time()
@@ -188,15 +253,15 @@ for idx, hdr_file in enumerate(files):
     if seg_cfg["save_kernels"]:
         print("saving kernels images...")
         kernels.save_kernels(
-            output_path=config["data"]["output_path"],
+            output_path=file_output,
             sample=sample, date=date, hour=hour
         )
 
     # Save kernel spectra
     print("saving kernels spectra...")
     kernels.save_Kernelspectra(
-        ihsr=spectrum.img[:,config["segment_kernels"]["crop_x_left"]:config["segment_kernels"]["crop_x_right"],:],
-        output_path=config["data"]["output_path"],
+        ihsr=spectrum.img[:, seg_cfg["crop_x_left"]:seg_cfg["crop_x_right"], :],
+        output_path=file_output,
         sample=sample, date=date, hour=hour,
         ref=spectrum.reference
     )
@@ -207,7 +272,7 @@ for idx, hdr_file in enumerate(files):
         t0spec = time.time()
         specasd = SpectrumASD(asd_file)
         specasd.save_spectrum(
-            output_path=config["data"]["output_path"],
+            output_path=file_output,
             sample=sample, date=date, hour=hour
         )
         t1spec = time.time()

@@ -1,6 +1,8 @@
 /runs/
 /yolo*
-/kernels.cpy
+/__pycache__/kernels.cpy*
+/output/
+/models/sam*
 /yolo_seg/save/
 /datasets/
 /images/in/2024-09-07_105245_740-6_HyperS.hdr

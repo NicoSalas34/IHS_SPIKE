@@ -2,15 +2,15 @@ data:
     input_path: /media/debian/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/Temp #F:\fourmis\IHS_SPIKE_fourmis24\data\epis_preda
     output_path: /media/debian/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/output  #SOLACE2021 #F:\fourmis\IHS_SPIKE_fourmis24\results\epis_preda
 
-# mode: "sam" or "yolo"
-mode: yolo
+# mode: "sam" or "yolo" or "combined"
+mode: combined
 
 segment_kernels:
     model_path: models/sam_b.pt
     output_mask_path: None
     device: cuda #cpu
     model_type: vit_b # vit_l
-    area_min: 700 # 4000
+    area_min: 0 # 4000
     area_max: 5000 #15000
     crop_x_left:  400 # 690
     crop_x_right: 2180 #3470
@@ -27,4 +27,29 @@ yolo:
     imgsz_seg: 640
     crop_x_left:  400
     crop_x_right: 2180
+    area_min: 700
+    area_max: 5000
     save_kernels: False
+
+combined:
+    sam_model_path: models/sam3.pt
+    imgsz_sam: 672    # multiple de 14 (patch ViT) — 672=48×14 ; monter à 896=64×14 si GPU>=16 GB
+    sam_text_prompts:
+        - "grain"
+        - "broken grain"
+        - "grain fragment"
+    det_model_path: models/grains_det.pt
+    seg_model_path: models/grains_crops-5.pt
+    device: cuda
+    det_conf: 0.3
+    seg_conf: 0.25
+    nms_threshold: 0.5      # IoU pour NMS interne SAM (dédupliquer multi-prompt)
+    iou_threshold: 0.3      # IoU pour fusion SAM + YOLO det
+    pad: 0.25
+    imgsz_det: 1280
+    imgsz_seg: 640
+    crop_x_left:  400
+    crop_x_right: 2180
+    area_min: 300
+    area_max: 5000
+    save_kernels: Falses

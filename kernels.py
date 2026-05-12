@@ -218,6 +218,7 @@ class Kernels():
             np.save(f, ref)
 
     def RebuildFromSpectra(self):  # noqa: N802
+
         # Définir les dimensions des matrices
         imred = np.ones((sp[:, 2].max(), sp[:, 1].max()))  # Matrice initialisée à 1
         imgr = np.zeros((sp[:, 2].max(), sp[:, 1].max()))  # Matrice initialisée à 0
@@ -276,20 +277,19 @@ class KernelsYOLO:
         imgsz_seg: int = 640,
         device: str = "0",
     ):
-        # Crop to ROI and convert to uint8 for YOLO
+        # Crop to ROI (image_rgb is RGB float 0-1, as produced by SpectrumCamera)
         img_float = image_rgb[:, crop_x_left:crop_x_right]
-        if img_float.dtype != np.uint8:
-            img_uint8 = (np.clip(img_float, 0, 1) * 255).astype(np.uint8)
-        else:
-            img_uint8 = img_float
-        self.image_rgb = img_float
-        self._img_uint8 = img_uint8
+        img_u8_rgb = (np.clip(img_float, 0, 1) * 255).astype(np.uint8)
+        # YOLO was trained on BGR images (cv2.imwrite convention)
+        img_bgr = cv2.cvtColor(img_u8_rgb, cv2.COLOR_RGB2BGR)
+        self.image_rgb = img_float          # RGB float, pour l'affichage matplotlib
+        self._img_uint8 = img_bgr           # BGR uint8, pour YOLO et cv2.split
 
-        H, W = img_uint8.shape[:2]
+        H, W = img_bgr.shape[:2]
 
         # Stage 1 — detect all grains
         det_res = det_model.predict(
-            img_uint8, conf=det_conf, imgsz=imgsz_det,
+            img_bgr, conf=det_conf, imgsz=imgsz_det,
             device=device, verbose=False
         )[0]
 
@@ -311,7 +311,7 @@ class KernelsYOLO:
             if cw < 8 or ch < 8:
                 continue
 
-            crop = img_uint8[cy1:cy2, cx1:cx2]
+            crop = img_bgr[cy1:cy2, cx1:cx2]
 
             # Stage 2 — segment the crop
             seg_res = seg_model.predict(
@@ -488,3 +488,164 @@ class KernelsYOLO:
             np.save(f, spm)
         with gzip.GzipFile(f"{output_path}/{date}_{hour}_{sample}_ref.gz", "wb") as f:
             np.save(f, ref)
+
+
+# ===================================
+#       HELPERS COMBINED PIPELINE
+def _bbox_iou(b1, b2):
+    """IoU entre deux bboxes [x, y, w, h]."""
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[0] + b1[2], b2[0] + b2[2])
+    y2 = min(b1[1] + b1[3], b2[1] + b2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = b1[2] * b1[3] + b2[2] * b2[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _mask_iou(m1, m2):
+    """IoU pixel entre deux masques booléens."""
+    inter = (m1 & m2).sum()
+    union = (m1 | m2).sum()
+    return inter / union if union > 0 else 0.0
+
+
+def _nms_masks(masks, iou_threshold=0.5):
+    """NMS sur une liste de masques. Trie par aire décroissante, supprime les doublons."""
+    masks = sorted(masks, key=lambda m: m["area"], reverse=True)
+    kept = []
+    for m in masks:
+        if not any(_mask_iou(m["segmentation"], k["segmentation"]) >= iou_threshold
+                   for k in kept):
+            kept.append(m)
+    return kept
+
+
+def _classify_crop(img_bgr, bbox, seg_model, seg_conf, imgsz_seg, pad, H, W, device):
+    """Crop + YOLO-seg. Retourne (cls, conf, full_mask | None)."""
+    x, y, bw, bh = bbox
+    px, py = bw * pad, bh * pad
+    cx1 = max(0, int(x - px));  cy1 = max(0, int(y - py))
+    cx2 = min(W, int(x + bw + px)); cy2 = min(H, int(y + bh + py))
+    cw, ch = cx2 - cx1, cy2 - cy1
+    if cw < 8 or ch < 8:
+        return 0, 0.0, None
+    crop = img_bgr[cy1:cy2, cx1:cx2]
+    seg_res = seg_model.predict(crop, conf=seg_conf, imgsz=imgsz_seg,
+                                device=device, verbose=False)[0]
+    if seg_res.boxes is not None and len(seg_res.boxes) > 0:
+        best = int(seg_res.boxes.conf.argmax())
+        cls  = int(seg_res.boxes[best].cls.item())
+        conf = float(seg_res.boxes[best].conf.item())
+        if seg_res.masks is not None:
+            mc = seg_res.masks.data[best].cpu().numpy()
+            mc = cv2.resize(mc, (cw, ch), interpolation=cv2.INTER_NEAREST)
+            full_mask = np.zeros((H, W), dtype=bool)
+            full_mask[cy1:cy2, cx1:cx2] = mc > 0.5
+        else:
+            full_mask = None
+    else:
+        cls, conf, full_mask = 0, 0.0, None
+    return cls, conf, full_mask
+
+
+# ===================================
+#       COMBINED SAM + YOLO CLASS
+class KernelsSAMYOLO(KernelsYOLO):
+    """
+    Combined pipeline: SAM for grain segmentation, YOLO-seg for grain/broken classification.
+
+    Stage 1 — SAM generates masks for all grains (contours précis).
+    Stage 2 — YOLO-seg classifies each SAM crop as grain (0) or broken (1).
+
+    When YOLO finds no detection in a crop, the grain defaults to class 0 (intact).
+    All save methods are inherited from KernelsYOLO.
+    """
+
+    def __init__(
+        self,
+        image_rgb: np.ndarray,
+        sam_model,
+        det_model,
+        seg_model,
+        crop_x_left: int,
+        crop_x_right: int,
+        text_prompts: list = None,
+        det_conf: float = 0.3,
+        seg_conf: float = 0.25,
+        nms_threshold: float = 0.5,
+        iou_threshold: float = 0.3,
+        pad: float = 0.25,
+        imgsz_det: int = 1280,
+        imgsz_seg: int = 640,
+        device: str = "0",
+    ):
+        if text_prompts is None:
+            text_prompts = ["grain", "broken grain", "grain fragment"]
+
+        img_roi = image_rgb[:, crop_x_left:crop_x_right]
+        img_u8_rgb = (np.clip(img_roi, 0, 1) * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_u8_rgb, cv2.COLOR_RGB2BGR)
+        self.image_rgb = img_roi
+        self._img_uint8 = img_bgr
+        H, W = img_bgr.shape[:2]
+
+        # --- Stage 1a : SAM3 multi-prompt ---
+        import torch
+        sam_model.set_image(img_bgr)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            res = sam_model(text=text_prompts)
+        sam_raw = []
+        if res and res[0].masks is not None:
+            for mask_tensor in res[0].masks.data:
+                mask = mask_tensor.cpu().numpy().astype(bool)
+                ys, xs = np.where(mask)
+                if len(xs) == 0:
+                    continue
+                x, y = int(xs.min()), int(ys.min())
+                bw, bh = int(xs.max()) - x, int(ys.max()) - y
+                sam_raw.append({"segmentation": mask, "bbox": [x, y, bw, bh],
+                                "area": int(mask.sum()), "source": "sam"})
+        # Libère les tenseurs SAM de la mémoire GPU dès que les masques sont sur CPU
+        del res
+        torch.cuda.empty_cache()
+
+        # NMS intra-SAM : supprime les doublons issus du multi-prompt
+        candidates = _nms_masks(sam_raw, iou_threshold=nms_threshold)
+        print(f"    > SAM3 : {len(sam_raw)} bruts → {len(candidates)} après NMS")
+
+        # --- Stage 1b : YOLO det → bboxes complémentaires ---
+        det_res = det_model.predict(img_bgr, conf=det_conf, imgsz=imgsz_det,
+                                    device=device, verbose=False)[0]
+        n_yolo = 0
+        if det_res.boxes is not None:
+            for box in det_res.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                det_bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+                det_mask = np.zeros((H, W), dtype=bool)
+                det_mask[int(y1):int(y2), int(x1):int(x2)] = True
+                # Fusion par IoU masque (plus précis que bbox IoU)
+                if not any(_mask_iou(det_mask, m["segmentation"]) >= iou_threshold
+                           for m in candidates):
+                    candidates.append({"segmentation": det_mask, "bbox": det_bbox,
+                                       "area": int(det_mask.sum()), "source": "yolo"})
+                    n_yolo += 1
+        print(f"    > YOLO det : {n_yolo} masques ajoutés")
+
+        # --- Stage 2 : YOLO seg — classification grain / broken ---
+        self.masks = []
+        for m in candidates:
+            cls, conf, yolo_mask = _classify_crop(
+                img_bgr, m["bbox"], seg_model, seg_conf,
+                imgsz_seg, pad, H, W, device
+            )
+            seg = m["segmentation"] if (m["source"] == "sam" or yolo_mask is None) \
+                else yolo_mask
+            self.masks.append({
+                "segmentation": seg,
+                "bbox":         m["bbox"],
+                "area":         m["area"],
+                "class":        cls,
+                "confidence":   conf,
+                "source":       m["source"],
+            })
