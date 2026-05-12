@@ -14,9 +14,9 @@ hyperspectral data acquistion.
 import os, cv2
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from segment_anything import SamAutomaticMaskGenerator, modeling
 from skimage.measure import regionprops
 import gzip
@@ -217,7 +217,7 @@ class Kernels():
         with gzip.GzipFile(f"{output_path}/{date}_{hour}_{sample}_ref.gz", "wb") as f:
             np.save(f, ref)
 
-    def RebuildFromSpectra(self):
+    def RebuildFromSpectra(self):  # noqa: N802
         # Définir les dimensions des matrices
         imred = np.ones((sp[:, 2].max(), sp[:, 1].max()))  # Matrice initialisée à 1
         imgr = np.zeros((sp[:, 2].max(), sp[:, 1].max()))  # Matrice initialisée à 0
@@ -237,3 +237,254 @@ class Kernels():
         plt.imshow(imrgb)  # Conversion en entier si nécessaire
         plt.axis('off')
         plt.show()
+
+
+# ===================================
+#       YOLO TWO-STAGE CLASS
+CLASS_NAMES = {0: "grain", 1: "broken"}
+CLASS_COLORS = {0: (0, 200, 0), 1: (0, 0, 220)}   # grain=vert, broken=rouge
+
+
+class KernelsYOLO:
+    """
+    Two-stage YOLO pipeline that mirrors the Kernels (SAM) interface.
+
+    Stage 1 — YOLO-det on the full (cropped) image → bounding boxes.
+    Stage 2 — YOLO-seg on each grain crop          → mask + class (grain/broken).
+
+    Each entry in self.masks is a dict compatible with the SAM format:
+        {
+            'segmentation': np.ndarray bool (H, W),
+            'bbox':         [x_min, y_min, width, height],   # pixel coords
+            'area':         int,
+            'class':        int,   # 0=grain, 1=broken
+            'confidence':   float,
+        }
+    """
+
+    def __init__(
+        self,
+        image_rgb: np.ndarray,
+        det_model,
+        seg_model,
+        crop_x_left: int,
+        crop_x_right: int,
+        det_conf: float = 0.3,
+        seg_conf: float = 0.25,
+        pad: float = 0.25,
+        imgsz_det: int = 1280,
+        imgsz_seg: int = 640,
+        device: str = "0",
+    ):
+        # Crop to ROI and convert to uint8 for YOLO
+        img_float = image_rgb[:, crop_x_left:crop_x_right]
+        if img_float.dtype != np.uint8:
+            img_uint8 = (np.clip(img_float, 0, 1) * 255).astype(np.uint8)
+        else:
+            img_uint8 = img_float
+        self.image_rgb = img_float
+        self._img_uint8 = img_uint8
+
+        H, W = img_uint8.shape[:2]
+
+        # Stage 1 — detect all grains
+        det_res = det_model.predict(
+            img_uint8, conf=det_conf, imgsz=imgsz_det,
+            device=device, verbose=False
+        )[0]
+
+        self.masks = []
+        if det_res.boxes is None or len(det_res.boxes) == 0:
+            return
+
+        for box in det_res.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+            # Pad bbox
+            bw, bh = x2 - x1, y2 - y1
+            px, py = bw * pad, bh * pad
+            cx1 = max(0, int(x1 - px))
+            cy1 = max(0, int(y1 - py))
+            cx2 = min(W, int(x2 + px))
+            cy2 = min(H, int(y2 + py))
+            cw, ch = cx2 - cx1, cy2 - cy1
+            if cw < 8 or ch < 8:
+                continue
+
+            crop = img_uint8[cy1:cy2, cx1:cx2]
+
+            # Stage 2 — segment the crop
+            seg_res = seg_model.predict(
+                crop, conf=seg_conf, imgsz=imgsz_seg,
+                device=device, verbose=False
+            )[0]
+
+            if seg_res.masks is None or len(seg_res.masks) == 0:
+                continue
+
+            # Keep highest-confidence instance (central grain)
+            best_idx = int(seg_res.boxes.conf.argmax())
+            cls = int(seg_res.boxes[best_idx].cls.item())
+            conf = float(seg_res.boxes[best_idx].conf.item())
+
+            mask_crop = seg_res.masks.data[best_idx].cpu().numpy()
+            mask_crop = cv2.resize(mask_crop, (cw, ch),
+                                   interpolation=cv2.INTER_NEAREST)
+            binary = mask_crop > 0.5
+
+            # Reproject into full ROI coordinates
+            full_mask = np.zeros((H, W), dtype=bool)
+            full_mask[cy1:cy2, cx1:cx2] = binary
+
+            self.masks.append({
+                "segmentation": full_mask,
+                "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                "area": int(binary.sum()),
+                "class": cls,
+                "confidence": conf,
+            })
+
+    # ------------------------------------------------------------------
+    #   Public interface — same as Kernels (SAM)
+    # ------------------------------------------------------------------
+
+    def filter_masks(self, area_min: int = 4000, area_max: int = 15000) -> None:
+        self.masks = [
+            m for m in self.masks
+            if area_min < m["area"] < area_max
+        ]
+        self.masks = sorted(self.masks, key=lambda x: x["bbox"], reverse=True)
+
+    def save_masks(self, output_path: str, sample: str, date: str, hour: str) -> None:
+        if not self.masks:
+            return
+        img_disp = self._img_uint8 if self._img_uint8.dtype == np.uint8 \
+            else (np.clip(self.image_rgb, 0, 1) * 255).astype(np.uint8)
+        H, W = img_disp.shape[:2]
+
+        overlay = img_disp.copy().astype(np.float32)
+        for m in self.masks:
+            color = CLASS_COLORS.get(m["class"], (128, 128, 128))
+            seg = m["segmentation"]
+            for c, val in enumerate(color):
+                overlay[:, :, c][seg] = val
+
+        blended = cv2.addWeighted(img_disp.astype(np.float32), 0.55,
+                                  overlay, 0.45, 0).astype(np.uint8)
+
+        fig, ax = plt.subplots(figsize=(22, 16))
+        ax.imshow(cv2.cvtColor(blended, cv2.COLOR_BGR2RGB))
+        for n, m in enumerate(self.masks, 1):
+            bbox = m["bbox"]
+            cx = bbox[0] + bbox[2] / 2
+            cy = bbox[1] + bbox[3] / 2
+            ax.text(cx, cy, str(n), fontsize=10, color="white")
+        ax.axis("off")
+        fig.savefig(
+            f"{output_path}/{date}_{hour}_{sample}_masks.jpg",
+            bbox_inches="tight"
+        )
+        plt.close(fig)
+
+    def add_regionprops(self) -> None:
+        self.rprops = [
+            regionprops(m["segmentation"].astype(np.uint8) * 255)[0]
+            for m in self.masks
+        ]
+
+    def save_rpops(self, output_path: str, sample: str, date: str, hour: str) -> None:
+        attrok = (
+            "area", "area_bbox", "area_convex", "eccentricity",
+            "equivalent_diameter_area", "euler_number", "extent",
+            "feret_diameter_max", "area_filled", "label",
+            "axis_major_length", "axis_minor_length", "orientation",
+            "perimeter", "perimeter_crofton", "solidity",
+        )
+        img = self._img_uint8
+        b, g, r = cv2.split(img)
+
+        res_list = []
+        for i, (m, props) in enumerate(zip(self.masks, self.rprops)):
+            mask = m["segmentation"]
+            i_dict = dict(
+                date=date, hour=hour, sample=sample, kernel=i + 1,
+                kernel_class=CLASS_NAMES.get(m["class"], "unknown"),
+                confidence=round(m["confidence"], 3),
+                blue_min=np.min(b[mask]),   blue_mean=np.mean(b[mask]),
+                blue_max=np.max(b[mask]),
+                green_min=np.min(g[mask]),  green_mean=np.mean(g[mask]),
+                green_max=np.max(g[mask]),
+                red_min=np.min(r[mask]),    red_mean=np.mean(r[mask]),
+                red_max=np.max(r[mask]),
+            )
+            for key in attrok:
+                i_dict[key] = props[key]
+            res_list.append(i_dict)
+
+        pd.DataFrame(res_list).to_csv(
+            f"{output_path}/{date}_{hour}_{sample}_props.csv", index=False
+        )
+
+    def save_kernels(self, output_path: str, sample: str, date: str, hour: str,
+                     size: int = 320, resize: bool = True) -> None:
+        os.makedirs(f"{output_path}/kernels", exist_ok=True)
+        img = self._img_uint8
+
+        for i, m in enumerate(self.masks):
+            mask_int = m["segmentation"].astype(np.uint8)
+            masked = cv2.bitwise_and(img, img, mask=mask_int)
+
+            x_min, y_min, w, h = m["bbox"]
+            add_w = int(round((size - w) / 2, 0))
+            add_h = int(round((size - h) / 2, 0))
+            y1, y2 = y_min - add_h, y_min + h + add_h
+            x1, x2 = x_min - add_w, x_min + w + add_w
+
+            im_h, im_w = masked.shape[:2]
+            if y1 < 0:
+                y2 += -y1; y1 = 0
+            if y2 > im_h:
+                y1 -= y2 - im_h
+            if x1 < 0:
+                x2 += -x1; x1 = 0
+            if x2 > im_w:
+                x1 -= x2 - im_w
+
+            crop = masked[max(0, y1):y2, max(0, x1):x2]
+            if resize:
+                crop = cv2.resize(crop, (640, 640), interpolation=cv2.INTER_CUBIC)
+            plt.imsave(
+                f"{output_path}/kernels/{date}_{hour}_{sample}_k{i+1}.jpg",
+                cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            )
+
+    def save_Kernelspectra(self, ihsr, ref, output_path: str,  # noqa: N802
+                            sample: str, date: str, hour: str) -> None:
+        sp = np.empty((0, ihsr.shape[2] + 3)).astype(np.int16)
+        spm = np.empty((0, ihsr.shape[2] + 3))
+        dep = ihsr.reshape(ihsr.shape[0] * ihsr.shape[1], ihsr.shape[2])
+
+        for i, m in enumerate(self.masks):
+            xy_coords = np.column_stack(np.where(m["segmentation"] > 0))
+            id_ = np.ravel_multi_index(
+                np.transpose(xy_coords), (ihsr.shape[0], ihsr.shape[1])
+            )
+            sp1 = np.array([dep[j, :] for j in id_]).astype(np.int16)
+            spcoord = np.concatenate(
+                (np.full((len(id_), 1), i + 1), xy_coords, sp1), axis=1
+            ).astype(np.int16)
+            sp = np.concatenate((sp, spcoord))
+
+            spcoord = spcoord.astype(np.float64)
+            for j in range(ref.shape[0]):
+                iok = spcoord[:, 1] == j
+                if np.any(iok):
+                    spcoord[iok, 3:] = spcoord[iok, 3:] / ref[j, :][np.newaxis, :]
+            spm = np.vstack((spm, spcoord.mean(axis=0)))
+
+        with gzip.GzipFile(f"{output_path}/{date}_{hour}_{sample}_sp_allpx.gz", "wb") as f:
+            np.save(f, sp)
+        with gzip.GzipFile(f"{output_path}/{date}_{hour}_{sample}_sp.gz", "wb") as f:
+            np.save(f, spm)
+        with gzip.GzipFile(f"{output_path}/{date}_{hour}_{sample}_ref.gz", "wb") as f:
+            np.save(f, ref)

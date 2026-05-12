@@ -1,3 +1,8 @@
+/runs/
+/yolo*
+/kernels.cpy
+/yolo_seg/save/
+/datasets/
 /images/in/2024-09-07_105245_740-6_HyperS.hdr
 /images/in/2024-09-07_105245_740-6_HyperS.hyspex
 /images/in/2024-09-07_105245_740-6_HyperS_RGB.jpg

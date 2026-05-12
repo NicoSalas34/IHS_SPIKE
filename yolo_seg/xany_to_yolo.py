@@ -57,9 +57,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="Directory with annotated JPG + JSON pairs")
     ap.add_argument("--output", required=True, help="Output dataset directory")
-    ap.add_argument("--classes", nargs="+", default=["intact", "broken"],
+    ap.add_argument("--classes", nargs="+", default=["grain", "broken"],
                    help="Class names in order (class index 0, 1, ...)")
-    ap.add_argument("--skip-labels", nargs="+", default=["grain"],
+    ap.add_argument("--skip-labels", nargs="*", default=[],
                    help="Labels to silently ignore (e.g. unrelabeled pre-annotations)")
     ap.add_argument("--val-ratio", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)

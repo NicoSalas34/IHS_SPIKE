@@ -12,21 +12,31 @@ hyperspectral data acquistione.
 import yaml, time, os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from segment_anything import sam_model_registry
-from kernels import Kernels
+from kernels import Kernels, KernelsYOLO
 from spectrum import SpectrumCamera, SpectrumASD
 import numpy as np
 
 # ================================
 #       PARAMETERS
 config = yaml.load(open('config.yml', 'r'), Loader=yaml.SafeLoader)
+MODE = config.get("mode", "sam")
 
 # ================================
 #       LOAD MODEL
-model_type = config["segment_kernels"]["model_type"]
-model_path = config["segment_kernels"]["model_path"]
-sam = sam_model_registry[model_type](checkpoint=model_path)
-sam.to(device=config["segment_kernels"]["device"])
+if MODE == "yolo":
+    from ultralytics import YOLO
+    yolo_cfg = config["yolo"]
+    det_model = YOLO(yolo_cfg["det_model_path"])
+    seg_model = YOLO(yolo_cfg["seg_model_path"])
+    print(f"Mode YOLO — det: {yolo_cfg['det_model_path']}")
+    print(f"           seg: {yolo_cfg['seg_model_path']}\n")
+else:
+    from segment_anything import sam_model_registry
+    model_type = config["segment_kernels"]["model_type"]
+    model_path = config["segment_kernels"]["model_path"]
+    sam = sam_model_registry[model_type](checkpoint=model_path)
+    sam.to(device=config["segment_kernels"]["device"])
+    print(f"Mode SAM — {model_path}\n")
 
 # ================================
 #       PROCESS FILES
@@ -115,20 +125,40 @@ for idx, hdr_file in enumerate(files):
     # Segmentation
     print("segmentation...")
     t0seg = time.time()
-    kernels = Kernels(
-        image_rgb=np.divide(spectrum.img[:,:,spectrum.bands],2**15),  #spectrum.image_rgb
-        sam_model=sam,
-        crop_x_left = config["segment_kernels"]["crop_x_left"],
-        crop_x_right = config["segment_kernels"]["crop_x_right"]
-    )
+    image_rgb = np.divide(spectrum.img[:,:,spectrum.bands], 2**15)
+
+    if MODE == "yolo":
+        kernels = KernelsYOLO(
+            image_rgb=image_rgb,
+            det_model=det_model,
+            seg_model=seg_model,
+            crop_x_left=yolo_cfg["crop_x_left"],
+            crop_x_right=yolo_cfg["crop_x_right"],
+            det_conf=yolo_cfg["det_conf"],
+            seg_conf=yolo_cfg["seg_conf"],
+            pad=yolo_cfg["pad"],
+            imgsz_det=yolo_cfg["imgsz_det"],
+            imgsz_seg=yolo_cfg["imgsz_seg"],
+            device=yolo_cfg["device"],
+        )
+        seg_cfg = yolo_cfg
+    else:
+        kernels = Kernels(
+            image_rgb=image_rgb,
+            sam_model=sam,
+            crop_x_left=config["segment_kernels"]["crop_x_left"],
+            crop_x_right=config["segment_kernels"]["crop_x_right"],
+        )
+        seg_cfg = config["segment_kernels"]
+
     t1seg = time.time()
     print(f"    > seg time = {round(t1seg-t0seg, 0)}s")
 
     # Filter masks
     print("number of masks BEFORE filtering : ", len(kernels.masks))
     kernels.filter_masks(
-        area_min=config["segment_kernels"]["area_min"],
-        area_max=config["segment_kernels"]["area_max"]
+        area_min=seg_cfg["area_min"],
+        area_max=seg_cfg["area_max"]
     )
     print("number of masks AFTER filtering : ", len(kernels.masks))
 
@@ -155,7 +185,7 @@ for idx, hdr_file in enumerate(files):
     print(f"    > rprops time = {round(t1rpro - t0rpro, 0)}s")
 
     # Save Kernels
-    if config["segment_kernels"]["save_kernels"]:
+    if seg_cfg["save_kernels"]:
         print("saving kernels images...")
         kernels.save_kernels(
             output_path=config["data"]["output_path"],

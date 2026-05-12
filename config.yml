@@ -2,6 +2,9 @@ data:
     input_path: /media/debian/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/Temp #F:\fourmis\IHS_SPIKE_fourmis24\data\epis_preda
     output_path: /media/debian/Crucial X9/Bacs_bbsocoul_2024-2025_SPIKE/2026-04-20_104251_BBbac25_2/output  #SOLACE2021 #F:\fourmis\IHS_SPIKE_fourmis24\results\epis_preda
 
+# mode: "sam" or "yolo"
+mode: yolo
+
 segment_kernels:
     model_path: models/sam_b.pt
     output_mask_path: None
@@ -12,3 +15,16 @@ segment_kernels:
     crop_x_left:  400 # 690
     crop_x_right: 2180 #3470
     save_kernels: False # save rgb image for each kernel or not
+
+yolo:
+    det_model_path: models/grains_det.pt
+    seg_model_path: models/grains_crops-5.pt
+    device: cuda
+    det_conf: 0.3
+    seg_conf: 0.25
+    pad: 0.25
+    imgsz_det: 1280
+    imgsz_seg: 640
+    crop_x_left:  400
+    crop_x_right: 2180
+    save_kernels: False

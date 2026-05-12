@@ -1,17 +1,16 @@
 """
-Pre-annotate hyperspectral images with SAM and export to X-AnyLabeling JSON.
+Pre-annotate hyperspectral images with YOLO-seg and export to X-AnyLabeling JSON.
 
 Pipeline:
   .hdr/.hyspex -> SpectrumCamera (RGB normalized by spectralon)
               -> crop x [crop_x_left:crop_x_right]
               -> save as JPG (uint8)
-              -> SAM AutomaticMaskGenerator
-              -> filter by area
-              -> contour -> polygon -> LabelMe-style JSON (compatible X-AnyLabeling)
+              -> YOLO-seg inference
+              -> mask -> polygon -> LabelMe-style JSON (compatible X-AnyLabeling)
 
 Usage:
   python yolo_seg/preannotate.py --input <dir|hdr> --output <dir> \
-      [--sam-model models/sam_b.pt] [--sam-type vit_b] [--device cuda]
+      [--weights runs/segment/seg/grains/weights/best.pt] [--conf 0.25] [--device cuda]
 """
 
 import argparse
@@ -24,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
-from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from ultralytics import YOLO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from spectrum import SpectrumCamera
@@ -55,20 +54,7 @@ def mask_to_polygon(mask: np.ndarray, epsilon_ratio: float = 0.002) -> list | No
 
 
 def build_labelme_json(image_name: str, height: int, width: int,
-                      polygons: list, default_label: str) -> dict:
-    shapes = [
-        {
-            "label": default_label,
-            "points": poly,
-            "group_id": None,
-            "description": "",
-            "difficult": False,
-            "shape_type": "polygon",
-            "flags": {},
-            "attributes": {},
-        }
-        for poly in polygons
-    ]
+                       shapes: list) -> dict:
     return {
         "version": "2.4.0",
         "flags": {},
@@ -86,16 +72,68 @@ def collect_hdr_files(input_path: Path) -> list[Path]:
     return sorted(input_path.rglob("*.hdr"))
 
 
+def collect_jpg_files(input_path: Path) -> list[Path]:
+    if input_path.is_file() and input_path.suffix.lower() in (".jpg", ".jpeg"):
+        return [input_path]
+    return sorted(input_path.glob("*.jpg")) + sorted(input_path.glob("*.jpeg"))
+
+
 def is_loadable(hdr_file: Path) -> bool:
     hyspex = str(hdr_file).replace(".hdr", ".hyspex")
     return os.path.exists(hyspex) and os.stat(hyspex).st_size >= 3e8
 
 
-def process_one(hdr_file: Path, output_dir: Path, mask_gen,
-               crop_x_left: int, crop_x_right: int,
-               area_min: int, area_max: int,
-               default_label: str, epsilon_ratio: float,
-               spectrum=None) -> bool:
+def process_jpg(jpg_file: Path, output_dir: Path, model: YOLO,
+                conf: float, imgsz: int, device: str,
+                epsilon_ratio: float) -> bool:
+    out_json = output_dir / f"{jpg_file.stem}.json"
+    if out_json.exists():
+        print(f"  - already done: {jpg_file.name}")
+        return True
+
+    img = cv2.imread(str(jpg_file))
+    if img is None:
+        print(f"  ! cannot read: {jpg_file.name}")
+        return False
+    h, w = img.shape[:2]
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = model.predict(rgb, conf=conf, imgsz=imgsz, device=device, verbose=False)
+    r = results[0]
+
+    shapes = []
+    if r.masks is not None:
+        for mask_tensor, box in zip(r.masks.data, r.boxes):
+            label = model.names[int(box.cls.item())]
+            mask = mask_tensor.cpu().numpy()
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            poly = mask_to_polygon((mask > 0.5).astype(np.uint8), epsilon_ratio=epsilon_ratio)
+            if poly is None:
+                continue
+            shapes.append({
+                "label": label,
+                "points": poly,
+                "group_id": None,
+                "description": "",
+                "difficult": False,
+                "shape_type": "polygon",
+                "flags": {},
+                "attributes": {},
+            })
+
+    js = build_labelme_json(jpg_file.name, h, w, shapes)
+    with open(out_json, "w") as f:
+        json.dump(js, f, indent=2)
+    n_grain = sum(1 for s in shapes if s["label"] == "grain")
+    n_broken = sum(1 for s in shapes if s["label"] == "broken")
+    print(f"  > wrote {out_json.name} ({n_grain} grain, {n_broken} broken)")
+    return True
+
+
+def process_one(hdr_file: Path, output_dir: Path, model: YOLO,
+                crop_x_left: int, crop_x_right: int,
+                conf: float, imgsz: int, device: str,
+                epsilon_ratio: float, spectrum=None) -> bool:
     if not is_loadable(hdr_file):
         hyspex = str(hdr_file).replace(".hdr", ".hyspex")
         if not os.path.exists(hyspex):
@@ -117,21 +155,37 @@ def process_one(hdr_file: Path, output_dir: Path, mask_gen,
     rgb_u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
     cv2.imwrite(str(out_jpg), cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR))
 
-    masks = mask_gen.generate(rgb)
-    masks = [m for m in masks if area_min < m["area"] < area_max]
-    print(f"  > {len(masks)} masks (after area filter)")
+    h, w = rgb_u8.shape[:2]
+    results = model.predict(rgb_u8, conf=conf, imgsz=imgsz, device=device, verbose=False)
+    r = results[0]
 
-    polygons = []
-    for m in masks:
-        poly = mask_to_polygon(m["segmentation"], epsilon_ratio=epsilon_ratio)
-        if poly is not None:
-            polygons.append(poly)
+    shapes = []
+    if r.masks is not None:
+        for mask_tensor, box in zip(r.masks.data, r.boxes):
+            label = model.names[int(box.cls.item())]
+            mask = mask_tensor.cpu().numpy()
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            poly = mask_to_polygon((mask > 0.5).astype(np.uint8), epsilon_ratio=epsilon_ratio)
+            if poly is None:
+                continue
+            shapes.append({
+                "label": label,
+                "points": poly,
+                "group_id": None,
+                "description": "",
+                "difficult": False,
+                "shape_type": "polygon",
+                "flags": {},
+                "attributes": {},
+            })
 
-    js = build_labelme_json(out_jpg.name, rgb_u8.shape[0], rgb_u8.shape[1],
-                           polygons, default_label)
+    js = build_labelme_json(out_jpg.name, h, w, shapes)
     with open(out_json, "w") as f:
         json.dump(js, f, indent=2)
-    print(f"  > wrote {out_jpg.name} + {out_json.name} ({len(polygons)} polygons)")
+    n_grain = sum(1 for s in shapes if s["label"] == "grain")
+    n_broken = sum(1 for s in shapes if s["label"] == "broken")
+    print(f"  > wrote {out_jpg.name} + {out_json.name} "
+          f"({n_grain} grain, {n_broken} broken)")
     return True
 
 
@@ -142,36 +196,48 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help=".hdr file or directory containing .hdr files")
     ap.add_argument("--output", required=True, help="Output directory for JPG + JSON pairs")
-    ap.add_argument("--sam-model", default=seg_cfg.get("model_path", "models/sam_b.pt"))
-    ap.add_argument("--sam-type", default=seg_cfg.get("model_type", "vit_b"))
+    ap.add_argument("--weights", default="runs/segment/seg/grains/weights/best.pt",
+                    help="Path to YOLO-seg best.pt weights")
+    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--imgsz", type=int, default=1280)
     ap.add_argument("--device", default=seg_cfg.get("device", "cuda"))
     ap.add_argument("--crop-x-left", type=int, default=seg_cfg.get("crop_x_left", 400))
     ap.add_argument("--crop-x-right", type=int, default=seg_cfg.get("crop_x_right", 2200))
-    ap.add_argument("--area-min", type=int, default=seg_cfg.get("area_min", 700))
-    ap.add_argument("--area-max", type=int, default=seg_cfg.get("area_max", 5000))
-    ap.add_argument("--default-label", default="grain",
-                   help="Label assigned to every pre-annotation (you re-label in X-AnyLabeling)")
-    ap.add_argument("--epsilon", type=float, default=0.002,
-                   help="Polygon simplification ratio (higher = fewer points)")
+    ap.add_argument("--epsilon", type=float, default=0.0005,
+                    help="Polygon simplification ratio (higher = fewer points)")
     args = ap.parse_args()
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading SAM {args.sam_type} from {args.sam_model} on {args.device}...")
-    sam = sam_model_registry[args.sam_type](checkpoint=args.sam_model)
-    sam.to(device=args.device)
-    mask_gen = SamAutomaticMaskGenerator(model=sam, box_nms_thresh=0.25)
+    print(f"Loading YOLO-seg weights from {args.weights}...")
+    model = YOLO(args.weights)
 
-    files = collect_hdr_files(input_path)
+    hdr_files = collect_hdr_files(input_path)
+    jpg_files = collect_jpg_files(input_path) if input_path.is_dir() else []
+
+    if not hdr_files and jpg_files:
+        print(f"No .hdr found — running inference on {len(jpg_files)} JPG(s)\n")
+        ok = 0
+        for i, jpg in enumerate(jpg_files):
+            print(f"[{i+1}/{len(jpg_files)}] {jpg.name}")
+            try:
+                if process_jpg(jpg, output_dir, model,
+                               args.conf, args.imgsz, args.device, args.epsilon):
+                    ok += 1
+            except Exception as e:
+                print(f"  !! error: {e}")
+        print(f"\nDone: {ok}/{len(jpg_files)} processed -> {output_dir}")
+        return
+
+    files = hdr_files
     print(f"Found {len(files)} .hdr file(s)\n")
 
     executor = ThreadPoolExecutor(max_workers=1)
     pending_spectrum = None
     pending_file = None
 
-    # Preload first loadable file
     for f in files:
         if is_loadable(f):
             pending_spectrum = executor.submit(SpectrumCamera, str(f))
@@ -182,12 +248,10 @@ def main():
     for i, hdr in enumerate(files):
         print(f"[{i+1}/{len(files)}] {hdr.name}")
         try:
-            # Get preloaded spectrum if available
             spectrum = None
             if pending_file == hdr and pending_spectrum is not None:
                 spectrum = pending_spectrum.result()
 
-            # Submit loading of next loadable file immediately
             pending_spectrum = None
             pending_file = None
             for next_file in files[i + 1:]:
@@ -196,20 +260,16 @@ def main():
                     pending_file = next_file
                     break
 
-            if process_one(hdr, output_dir, mask_gen,
-                          args.crop_x_left, args.crop_x_right,
-                          args.area_min, args.area_max,
-                          args.default_label, args.epsilon,
-                          spectrum=spectrum):
+            if process_one(hdr, output_dir, model,
+                           args.crop_x_left, args.crop_x_right,
+                           args.conf, args.imgsz, args.device,
+                           args.epsilon, spectrum=spectrum):
                 ok += 1
         except Exception as e:
             print(f"  !! error: {e}")
 
     executor.shutdown(wait=False)
-
     print(f"\nDone: {ok}/{len(files)} processed -> {output_dir}")
-    print("\nNext step: open the output folder in X-AnyLabeling, fix masks,")
-    print("relabel each polygon as 'intact' or 'broken', then save.")
 
 
 if __name__ == "__main__":
